@@ -174,7 +174,7 @@ end
 
 local function stopSpeakers()
     for _, speaker in ipairs(speakers) do
-        pcall(speaker.dev.stop, speaker.dev)
+        pcall(speaker.dev.stop)
     end
 end
 
@@ -327,7 +327,7 @@ local function pushAudio(pcm, my)
             if type(speaker.dev.playAudio) ~= "function" then
                 return false, "No playAudio"
             end
-            local ok, accepted = pcall(speaker.dev.playAudio, speaker.dev, pcm, volume)
+            local ok, accepted = pcall(speaker.dev.playAudio, pcm, volume)
             if not ok then
                 return false, tostring(accepted)
             elseif not accepted then
