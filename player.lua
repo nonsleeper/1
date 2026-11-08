@@ -7,14 +7,16 @@
 -- С компьютера: пробел пауза, стрелки влево/вправо перемотка на 10 с, n/p треки, s шафл, q выход.
 
 local API = "https://api.github.com/repos/nonsleeper/1/git/trees/master?recursive=1"
--- jsDelivr первый: с игрового сервера raw.githubusercontent.com часто зависает,
--- а cdn.jsdelivr.net уже открывается (через него скачивался сам плеер).
+-- Полный файл с raw.githubusercontent.com с игрового сервера не дочитывается:
+-- заголовки приходят (видно длительность), тело зависает. Короткие Range-запросы
+-- к тому же адресу возвращают ровно запрошенные байты. Range у jsDelivr для этих
+-- файлов отдаёт другие байты, поэтому для звука он не используется.
 local MIRRORS = {
-    "https://cdn.jsdelivr.net/gh/nonsleeper/1@master/",
     "https://raw.githubusercontent.com/nonsleeper/1/master/",
 }
 local CACHE = ".player_tracks"
 local CHUNK = 4 * 1024
+local PIECE = 8 * 1024
 local BYTES_PER_SECOND = 6000
 
 local dfpwm = require("cc.audio.dfpwm")
@@ -313,18 +315,29 @@ local function waitForBuffer(my)
 end
 
 local function pushAudio(pcm, my)
+    if type(pcm) ~= "table" or #pcm == 0 then return false, "Empty audio" end
     refreshSpeakers()
     if #speakers == 0 then return false, "No speakers" end
     local pending = {}
     for i, speaker in ipairs(speakers) do pending[i] = speaker end
+    local tries = 0
     while #pending > 0 and session == my do
         local left = {}
         for _, speaker in ipairs(pending) do
+            if type(speaker.dev.playAudio) ~= "function" then
+                return false, "No playAudio"
+            end
             local ok, accepted = pcall(speaker.dev.playAudio, speaker.dev, pcm, volume)
-            if not (ok and accepted) then left[#left + 1] = speaker end
+            if not ok then
+                return false, tostring(accepted)
+            elseif not accepted then
+                left[#left + 1] = speaker
+            end
         end
         pending = left
         if #pending > 0 and session == my then
+            tries = tries + 1
+            if tries > 6 then return false, "Speaker busy" end
             if not waitForBuffer(my) then return false end
             refreshSpeakers()
             local alive, names = {}, {}
@@ -333,17 +346,72 @@ local function pushAudio(pcm, my)
                 if names[speaker.name] then alive[#alive + 1] = speaker end
             end
             pending = alive
+            if #pending == 0 then return false, "Speaker detached" end
         end
     end
     return session == my
 end
 
-local function discardBytes(response, count, my)
-    local left = count
-    while left > 0 and session == my do
-        local chunk = response.read(math.min(CHUNK, left))
-        if not chunk or #chunk == 0 then return false end
-        left = left - #chunk
+local requestSerial = 0
+
+local function readPiece(base, encoded, startByte, endByte, my)
+    requestSerial = requestSerial + 1
+    local url = string.format("%s%s?b=%d&n=%d", base, encoded, startByte, requestSerial)
+    local headers = {
+        ["User-Agent"] = "CC-Jukebox",
+        ["Accept-Encoding"] = "identity",
+        ["Range"] = string.format("bytes=%d-%d", startByte, endByte),
+    }
+    local ok, err = http.request(url, nil, headers, true)
+    if not ok then return nil, tostring(err) end
+    local timer = os.startTimer(12)
+    local response
+    while session == my and not response do
+        local event, a, b = os.pullEvent()
+        if event == "http_success" then
+            if a == url then
+                response = b
+            elseif b and b.close then
+                pcall(b.close, b)
+            end
+        elseif event == "http_failure" and a == url then
+            return nil, tostring(b)
+        elseif event == "timer" and a == timer then
+            return nil, "Timeout"
+        end
+    end
+    if session ~= my then
+        if response then pcall(response.close, response) end
+        return nil, "Stopped"
+    end
+
+    local code = 0
+    pcall(function() code = response.getResponseCode() end)
+    local responseHeaders = {}
+    pcall(function() responseHeaders = response.getResponseHeaders() end)
+    local range = headerValue(responseHeaders, "Content-Range")
+    local total = range and tonumber(range:match("/(%d+)")) or nil
+    if code ~= 206 then
+        pcall(response.close, response)
+        return nil, "No range " .. tostring(code), total
+    end
+    local data = response.readAll()
+    pcall(response.close, response)
+    if not data or #data == 0 then return nil, "Empty piece", total end
+    return data, nil, total
+end
+
+local function playSlices(decoder, data, my)
+    local i = 1
+    while i <= #data and session == my do
+        local slice = data:sub(i, i + CHUNK - 1)
+        i = i + #slice
+        local pcm = decoder(slice)
+        position = position + #slice
+        os.queueEvent("player_draw")
+        local pushed, reason = pushAudio(pcm, my)
+        if not pushed then return false, reason end
+        os.queueEvent("player_draw")
     end
     return session == my
 end
@@ -354,83 +422,48 @@ local function playFile(path, my, offset)
         return false, "No speakers"
     end
 
-    local headers = {
-        ["User-Agent"] = "CC-Jukebox",
-        ["Accept-Encoding"] = "identity",
-    }
-    if offset > 0 then headers["Range"] = "bytes=" .. offset .. "-" end
     local encoded = encodePath(path)
-    local response, err
-    for _, base in ipairs(MIRRORS) do
-        if session ~= my then break end
-        status = "Downloading..."
-        os.queueEvent("player_draw")
-        response, err = http.get(base .. encoded, headers, true)
-        if response then break end
-    end
-    if session ~= my then
-        if response then response.close() end
-        return false
-    end
-    if not response then return false, tostring(err) end
-
-    responseHandle = response
-    local code = 200
-    pcall(function() code = response.getResponseCode() end)
-    local responseHeaders = {}
-    pcall(function() responseHeaders = response.getResponseHeaders() end)
-    local range = headerValue(responseHeaders, "Content-Range")
-    local length = tonumber(headerValue(responseHeaders, "Content-Length"))
-    if range then
-        local total = tonumber(range:match("/(%d+)"))
-        if total then totalBytes = total end
-    elseif code == 200 and length and offset == 0 then
-        totalBytes = length
-    end
-
-    if code == 200 and offset > 0 then
-        status = "Seek"
-        os.queueEvent("player_draw")
-        if not discardBytes(response, offset, my) then
-            if responseHandle == response then responseHandle = nil end
-            pcall(response.close, response)
-            return session == my, "Stream failed"
-        end
-    end
-
-    if session ~= my then
-        if responseHandle == response then responseHandle = nil end
-        pcall(response.close, response)
-        return false
-    end
-
-    position = offset
-    status = "Playing"
-    os.queueEvent("player_draw")
+    local cursor = offset
     local decoder = dfpwm.make_decoder()
-    local ok, playErr = pcall(function()
-        while session == my do
-            local chunk = response.read(CHUNK)
-            if session ~= my then break end
-            if not chunk or #chunk == 0 then break end
-            position = position + #chunk
-            local pcm = decoder(chunk)
-            local pushed, reason = pushAudio(pcm, my)
-            if not pushed then
-                if session == my then error(reason or "Speaker busy", 0) end
-                break
-            end
-            os.queueEvent("player_draw")
-        end
-    end)
+    position = offset
+    local lastErr = "Download failed"
 
-    if responseHandle == response then responseHandle = nil end
-    pcall(response.close, response)
-    if session ~= my then
-        stopSpeakers()
-        return false
+    while session == my do
+        if totalBytes > 0 and cursor >= totalBytes then break end
+        local last = cursor + PIECE - 1
+        if totalBytes > 0 and last >= totalBytes then last = totalBytes - 1 end
+        if totalBytes > 0 then
+            status = string.format("Get %d%%", math.floor(cursor / totalBytes * 100))
+        else
+            status = "Get..."
+        end
+        os.queueEvent("player_draw")
+
+        local data, err, total
+        for _, base in ipairs(MIRRORS) do
+            if session ~= my then break end
+            data, err, total = readPiece(base, encoded, cursor, last, my)
+            if data then break end
+            lastErr = err or lastErr
+        end
+        if session ~= my then return false end
+        if total and total > 0 then totalBytes = total end
+        if not data then return false, lastErr end
+
+        local expect = last - cursor + 1
+        if #data > expect then data = data:sub(1, expect) end
+        status = "Playing"
+        local played, reason = playSlices(decoder, data, my)
+        if not played then
+            if session ~= my then return false end
+            return false, reason
+        end
+        local short = #data < expect
+        cursor = cursor + #data
+        if short then break end
     end
-    if not ok then return false, playErr end
+
+    if session ~= my then return false end
     return true
 end
 
