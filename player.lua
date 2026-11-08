@@ -7,7 +7,12 @@
 -- С компьютера: пробел пауза, стрелки влево/вправо перемотка на 10 с, n/p треки, s шафл, q выход.
 
 local API = "https://api.github.com/repos/nonsleeper/1/git/trees/master?recursive=1"
-local RAW = "https://raw.githubusercontent.com/nonsleeper/1/master/"
+-- jsDelivr первый: с игрового сервера raw.githubusercontent.com часто зависает,
+-- а cdn.jsdelivr.net уже открывается (через него скачивался сам плеер).
+local MIRRORS = {
+    "https://cdn.jsdelivr.net/gh/nonsleeper/1@master/",
+    "https://raw.githubusercontent.com/nonsleeper/1/master/",
+}
 local CACHE = ".player_tracks"
 local CHUNK = 4 * 1024
 local BYTES_PER_SECOND = 6000
@@ -349,9 +354,20 @@ local function playFile(path, my, offset)
         return false, "No speakers"
     end
 
-    local headers = { ["User-Agent"] = "CC-Jukebox" }
+    local headers = {
+        ["User-Agent"] = "CC-Jukebox",
+        ["Accept-Encoding"] = "identity",
+    }
     if offset > 0 then headers["Range"] = "bytes=" .. offset .. "-" end
-    local response, err = http.get(RAW .. encodePath(path), headers, true)
+    local encoded = encodePath(path)
+    local response, err
+    for _, base in ipairs(MIRRORS) do
+        if session ~= my then break end
+        status = "Downloading..."
+        os.queueEvent("player_draw")
+        response, err = http.get(base .. encoded, headers, true)
+        if response then break end
+    end
     if session ~= my then
         if response then response.close() end
         return false
